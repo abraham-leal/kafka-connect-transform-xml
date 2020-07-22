@@ -22,7 +22,9 @@ import com.github.jcustenborder.kafka.connect.utils.transformation.BaseKeyValueT
 import com.github.jcustenborder.kafka.connect.xml.Connectable;
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.connect.connector.ConnectRecord;
+import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaAndValue;
+import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.DataException;
 import org.slf4j.Logger;
@@ -47,20 +49,21 @@ import java.util.Map;
 @DocumentationTip("XML schemas can be much more complex that what can be expressed in a Kafka " +
     "Connect struct. Elements that can be expressed as an anyType or something similar cannot easily " +
     "be used to infer type information.")
-public abstract class FromXml<R extends ConnectRecord<R>> extends BaseKeyValueTransformation<R> {
-  private static final Logger log = LoggerFactory.getLogger(FromXml.class);
-  FromXmlConfig config;
+public abstract class WBAFromXml<R extends ConnectRecord<R>> extends BaseKeyValueTransformation<R> {
+  private static final Logger log = LoggerFactory.getLogger(WBAFromXml.class);
+  WBAFromXmlConfig config;
   JAXBContext context;
   Unmarshaller unmarshaller;
-  XSDCompiler compiler;
+  WBAXSDCompiler compiler;
+  Schema dlqSchema;
 
-  protected FromXml(boolean isKey) {
+  protected WBAFromXml(boolean isKey) {
     super(isKey);
   }
 
   @Override
   public ConfigDef config() {
-    return FromXmlConfig.config();
+    return WBAFromXmlConfig.config();
   }
 
   @Override
@@ -123,8 +126,8 @@ public abstract class FromXml<R extends ConnectRecord<R>> extends BaseKeyValueTr
 
   @Override
   public void configure(Map<String, ?> settings) {
-    this.config = new FromXmlConfig(settings);
-    this.compiler = new XSDCompiler(this.config);
+    this.config = new WBAFromXmlConfig(settings);
+    this.compiler = new WBAXSDCompiler(this.config);
 
     try {
       this.context = compiler.compileContext();
@@ -137,48 +140,97 @@ public abstract class FromXml<R extends ConnectRecord<R>> extends BaseKeyValueTr
     } catch (JAXBException e) {
       throw new IllegalStateException(e);
     }
+
+    if (!config.rerouteTopic.equals("")) {
+      log.debug("Constructing DLQ Schema");
+      dlqSchema = new SchemaBuilder(Schema.Type.STRUCT)
+              .name("com.walgreens.dlq.schema").version(1)
+              .doc("Simple Schema for DLQ Messages from the XML Transform in Kafka Connect")
+              .field("badXML", Schema.STRING_SCHEMA)
+              .build();
+    }
   }
 
 
-  public static class Key<R extends ConnectRecord<R>> extends FromXml<R> {
+  public static class Key<R extends ConnectRecord<R>> extends WBAFromXml<R> {
     public Key() {
       super(true);
     }
 
     @Override
     public R apply(R r) {
-      final SchemaAndValue transformed = process(r, new SchemaAndValue(r.keySchema(), r.key()));
 
-      return r.newRecord(
-          r.topic(),
-          r.kafkaPartition(),
-          transformed.schema(),
-          transformed.value(),
-          r.valueSchema(),
-          r.value(),
-          r.timestamp()
-      );
+      try {
+        final SchemaAndValue transformed = process(r, new SchemaAndValue(r.keySchema(), r.key()));
+
+        return r.newRecord(
+                r.topic(),
+                r.kafkaPartition(),
+                transformed.schema(),
+                transformed.value(),
+                r.valueSchema(),
+                r.value(),
+                r.timestamp()
+        );
+
+      } catch (Exception e) {
+        if (!config.rerouteTopic.equals("")) {
+          log.debug("Invalid record, re-routing...");
+          Struct badData = new Struct(dlqSchema).put("badXML", r.key().toString());
+
+          return r.newRecord(
+                  config.rerouteTopic,
+                  r.kafkaPartition(),
+                  dlqSchema,
+                  badData,
+                  r.valueSchema(),
+                  r.value(),
+                  r.timestamp()
+          );
+        } else {
+          throw new DataException("Exception thrown while converting record key", e);
+        }
+      }
     }
   }
 
-  public static class Value<R extends ConnectRecord<R>> extends FromXml<R> {
+  public static class Value<R extends ConnectRecord<R>> extends WBAFromXml<R> {
     public Value() {
       super(false);
     }
 
     @Override
     public R apply(R r) {
-      final SchemaAndValue transformed = process(r, new SchemaAndValue(r.valueSchema(), r.value()));
 
-      return r.newRecord(
-          r.topic(),
-          r.kafkaPartition(),
-          r.keySchema(),
-          r.key(),
-          transformed.schema(),
-          transformed.value(),
-          r.timestamp()
-      );
+      try {
+        final SchemaAndValue transformed = process(r, new SchemaAndValue(r.valueSchema(), r.value()));
+
+        return r.newRecord(
+                r.topic(),
+                r.kafkaPartition(),
+                r.keySchema(),
+                r.key(),
+                transformed.schema(),
+                transformed.value(),
+                r.timestamp()
+        );
+      } catch (Exception e) {
+        if (!config.rerouteTopic.equals("")) {
+          log.debug("Invalid record, re-routing...");
+          Struct badData = new Struct(dlqSchema).put("badXML", r.value().toString());
+          return r.newRecord(
+                  config.rerouteTopic,
+                  r.kafkaPartition(),
+                  r.keySchema(),
+                  r.key(),
+                  dlqSchema,
+                  badData,
+                  r.timestamp()
+          );
+        } else {
+          throw new DataException("Exception thrown while converting record value", e);
+        }
+      }
     }
   }
 }
